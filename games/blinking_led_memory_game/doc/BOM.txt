@@ -1,0 +1,8 @@
+Bill Of Materials
+
+- Arduino uno x1
+- Push buttons x4
+- LED x4
+- Breadboard x1
+- Wire connector x10
+- 220 ohm resistor
