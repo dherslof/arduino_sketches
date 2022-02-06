@@ -5,4 +5,4 @@ Bill Of Materials
 - LED x4
 - Breadboard x1
 - Wire connector x10
-- 220 ohm resistor
+- 220 ohm resistor x8
