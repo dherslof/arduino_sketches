@@ -19,6 +19,6 @@ Would you like to end, or reset the game, hold down the button 1 for a minimum o
 Good Luck!
 
 ## Board 
-Current default board is now UNO. Hardcoded HW PIN values in the code. 
+Current default board is UNO. Hardcoded HW PIN values in the code. 
 
-Wiring can bee seen in the **doc** directory.
+Wiring can be seen in the **doc** directory.
