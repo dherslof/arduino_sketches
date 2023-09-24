@@ -1,0 +1,7 @@
+Bill Of Materials
+
+Capacitive soil sensor, x4
+Water pump, x4
+Relay module, 4x relay switches
+LED, x1
+Arduino UNO, x1
