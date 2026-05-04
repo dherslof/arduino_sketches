@@ -1,11 +1,16 @@
-// Description: to-be-written
+// Description: Automatic plant watering system. For a more detailed description and instructions on usage and setup, read the README.md
+// Inputs: 4x Soil sensor, 1x Ultrasonic distance sensor
+// Outputs 4x waterpumps 
+// Additional: 1x RTC, 1x SD-card writer
 // 
 // Author: dherslof
+// License: <TO-BE-DECIDED>
 
 #include <Wire.h>
 #include <DS3231.h>
 #include <avr/sleep.h>
 #include <avr/power.h>
+#include <avr/wdt.h>
 #include <SD.h>
 #include <SPI.h>
 
@@ -14,7 +19,7 @@
 #define PUMP_3_PIN_NUM 7  // DIG OUT PIN for pump 3
 #define PUMP_4_PIN_NUM 8  // DIG OUT PIN for pump 4
 
-#define PUMP_ON_TIME_S 5  // Time to keep the pump ON in seconds
+#define PUMP_ON_TIME_MS 5000  // Time to keep the pump ON in millie seconds
 
 #define PUMP_ON 1  // Convenient type def for pump ON
 #define PUMP_OFF 2 // Convenient type def for pump OFF
@@ -31,7 +36,7 @@
 #define VENUS_FLYTRAP_WATER_INTERVAL 16         // Tuning valueInterval for when this specific plant needs water. 16 => every 4th day (4 wakeups per day - every 6h)
 #define VENUS_FLYTRAP_WATER_EMPTY_CYCLES 4      // Tuning value. Indicates how many times pump can be activated before empty water container.
 
-#define WATER_LEVEL_DISTANCE_EMPTY_CM 25        // Tuning value. Distance (cm) to empty water level. Set for "normal bucket".
+#define WATER_LEVEL_DISTANCE_EMPTY_CM 16        // Tuning value. Distance (cm) to empty water level. Set for "normal bucket".
 #define NUM_OF_WATER_LEVEL_SENSOR_READINGS 10   // Tuning value Amount of times to read the sensor in order to calculate average distance to water
 #define HCSR04_TRIG_PIN_NUM 9                   // Ultrasonic sensor trigger pin
 #define HCSR04_ECHO_PIN_NUM 4                   // Ultrasonic sensor echo pin (10 before)
@@ -50,13 +55,23 @@
 //#define PUMP_MANUAL_ACTIVE_PB_PIN 9              // Push button to manually activate pump
 
 #define RTC_INTERRUPT_PIN_NUM 2        // Digital pin 2 is the interrupt pin on the UNO board
-#define SLEEP_INTERVAL_MINUTES 360     // Tuning value. Time between wakeups, 360min = 6h
+#define SLEEP_INTERVAL_MINUTES 180       // Tuning value. Time between wakeups, 360min = 6h 60=1h for testing
 #define DS3231_I2C_ADDRESS 0x68        // RTC I2C address, used for communication
 #define DS3231_CTRL_REG_ADDRESS 0x0E   // Control register address for rtc
 #define DS3231_ENABLE_ALARM1_VAL 0x05  // Set A1IE (1) and INTCN (1) => enabling alarm1 interrupt mode    
 #define DS3231_STATUS_REG_ADDRESS 0x0F // Status register for the rtc
 #define DS3231_CLEAR_ALARM1_VAL 0x00   // Bit 0 is the Alarm1 flag but value is for clearing full register
+ 
+// Run modes in order to calibrate the system before use
+#define NORMAL_MODE 0
+#define FULL_CALIBRATION_MODE 1
+#define PUMP_TEST_MODE 2
+#define CALIBRATION_DELAY_TIME 2000
 
+// Default run mode always normal. Temporary change if sensor calibration and/or testing is needed
+uint8_t system_run_mode = NORMAL_MODE;
+//uint8_t system_run_mode = FULL_CALIBRATION_MODE;
+//uint8_t system_run_mode = PUMP_TEST_MODE;
 
 // Global variables for soil sensor reading. Only 2 variables for memory constraints
 int soil_sensor_raw_value;
@@ -74,8 +89,7 @@ float current_average_water_level_distane_cm; // Avarge distance to water surfac
 long duration;                                // Duration between echo and response
 
 // Log file name
-const char* log_file_name = "ws_log.txt"; // WaterSystem Log file name
-char sd_log_entry[100];                   // Log entry buffer
+const char* log_file_name = "ws_log.txt";   // WaterSystem Log file name
 
 void CapacitiveSoilSensorRead(const uint8_t sensor_input_pin, int& raw, uint8_t& percentage) {
   // Serial prints only for debug
@@ -87,7 +101,8 @@ void CapacitiveSoilSensorRead(const uint8_t sensor_input_pin, int& raw, uint8_t&
   Serial.print(F("]: raw value = "));
   Serial.print(raw);
   Serial.print(F(" -> "));
-  Serial.println(percentage);
+  Serial.print(percentage);
+  Serial.println(F("%"));
 }
 
 void PumpInit(const uint8_t pump_out_pin) {
@@ -95,7 +110,7 @@ void PumpInit(const uint8_t pump_out_pin) {
   Serial.print(F("Init pump pin: "));
   Serial.println(pump_out_pin);
   pinMode(pump_out_pin, OUTPUT);
-  digitalWrite(pump_out_pin, LOW);
+  digitalWrite(pump_out_pin, HIGH);
 }
 
 void TogglePump(const uint8_t pump_out_pin, const uint8_t state) {
@@ -139,7 +154,8 @@ void SetAlarmForNextInterval(const uint16_t sleep_interval) {
   rtc.turnOnAlarm(1);
   
   Serial.print(F("Next alarm set for: "));
-  Serial.print(alarm_minute);
+  //Serial.print(alarm_minute);
+  Serial.print(alarm_hour);
   Serial.print(F(":"));
   if (alarm_minute < 10){
     Serial.print(F("0"));
@@ -164,6 +180,9 @@ void HandleInterrupt() {
 void GoToSleep() {
   Serial.println(F("Going to sleep..."));
   Serial.flush();
+
+  // Disable watchdog
+  wdt_disable();
   
   // Disable ADC
   ADCSRA &= ~(1 << ADEN);
@@ -187,8 +206,9 @@ void GoToSleep() {
   sleep_bod_disable();
   
   // Enter sleep mode
-  sleep_cpu();
   interrupts();
+  sleep_cpu();
+  //interrupts();
   
   // Code resumes here after wake-up
   sleep_disable();
@@ -246,18 +266,32 @@ void ReadAndCalculateAverageWaterDistance(float& average_distance) {
   Serial.print(NUM_OF_WATER_LEVEL_SENSOR_READINGS);
   Serial.print(F(" sensor readings are: "));
   Serial.print(average_distance);
-  Serial.print(F("cm"));
+  Serial.println(F("cm"));
 }
 
-//void WriteToSdLog(const String& data) {
-void WriteToSdLog(const char* data) {
+void logMessage(const __FlashStringHelper* msg, bool newLine = true) {
+  // 1. Print to Serial (using the F() macro automatically via __FlashStringHelper)
+  Serial.print(msg);
+  if(newLine) Serial.println();
+
+  // 2. Print to SD
   File logfile = SD.open(log_file_name, FILE_WRITE);
   if (logfile) {
-    logfile.println(data);
+    logfile.print(msg);
+    if(newLine) logfile.println();
     logfile.close();
-  } else {
-    Serial.println(F("Unable to open system logfile for writing"));
-    
+  }
+}
+
+void logValue(int val, bool newLine = true) {
+  Serial.print(val);
+  if(newLine) Serial.println();
+
+  File logfile = SD.open(log_file_name, FILE_WRITE);
+  if (logfile) {
+    logfile.print(val);
+    if(newLine) logfile.println();
+    logfile.close();
   }
 }
 
@@ -288,14 +322,18 @@ void setup() {
   // Init rtc
   // Current time has to be set during compilation
   rtc.setClockMode(false);  // Set to 24h mode
-  rtc.setYear(25);
-  rtc.setMonth(3);
-  rtc.setDate(8);
-  rtc.setDoW(6);  // 1=Sunday, 7=Saturday
-  rtc.setHour(18);
-  rtc.setMinute(13);
+  rtc.setYear(26);
+  rtc.setMonth(5);
+  rtc.setDate(3);
+  rtc.setDoW(1);  // 1=Sunday, 7=Saturday
+  rtc.setHour(15);
+  rtc.setMinute(27);
   rtc.setSecond(0);
 
+  clearAlarm();
+  rtc.turnOffAlarm(1);
+  rtc.turnOffAlarm(2);
+  
   // Attach interrupt to ISR function
   pinMode(RTC_INTERRUPT_PIN_NUM, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(RTC_INTERRUPT_PIN_NUM), HandleInterrupt, FALLING);
@@ -309,145 +347,221 @@ void setup() {
     SetSystemError();
   }
 
-  
-  sprintf(sd_log_entry, PSTR("System boot and setup done - Entering main loop"));
-  WriteToSdLog(sd_log_entry);
+  if (system_run_mode == FULL_CALIBRATION_MODE) {
+    Serial.println(F("Entering full calibration loop"));
+    while(true) {
+      // Display current time for RTC validation
+      bool h12, PM;
+      Serial.print(F("Current time: "));
+      Serial.print(rtc.getHour(h12, PM)); 
+      Serial.print(F(":"));
+      if (rtc.getMinute() < 10) Serial.print(F("0"));
+      Serial.print(rtc.getMinute());
+      Serial.print(F(":"));
+      if (rtc.getSecond() < 10) Serial.print(F("0"));
+      Serial.println(rtc.getSecond());
+
+      // Read and log water distance for calibration
+      ReadAndCalculateAverageWaterDistance(current_average_water_level_distane_cm);
+      Serial.print(F(" Water empty limit: "));
+      Serial.println(WATER_LEVEL_DISTANCE_EMPTY_CM);
+      delay(CALIBRATION_DELAY_TIME);
+
+      // Read and log Soil sensor percentage for calibration
+      CapacitiveSoilSensorRead(SOIL_SENSOR_1_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
+      delay(CALIBRATION_DELAY_TIME);
+      CapacitiveSoilSensorRead(SOIL_SENSOR_2_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
+      delay(CALIBRATION_DELAY_TIME);
+      CapacitiveSoilSensorRead(SOIL_SENSOR_3_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
+      delay(CALIBRATION_DELAY_TIME);
+      CapacitiveSoilSensorRead(SOIL_SENSOR_4_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
+      Serial.print(F("Dry limit: "));
+      Serial.print(SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE);
+      Serial.println(F("%"));
+      delay(CALIBRATION_DELAY_TIME);     
+    }
+  } else if (system_run_mode == PUMP_TEST_MODE) {
+    Serial.println(F("Entering pump testing loop"));
+    Serial.println(F("Delaying.."));
+    delay(CALIBRATION_DELAY_TIME);
+
+    while(true) {
+      Serial.print(F("Toggling P1 for: "));
+      Serial.println(PUMP_ON_TIME_MS);
+      
+      TogglePump(PUMP_1_PIN_NUM, PUMP_ON);
+      delay(PUMP_ON_TIME_MS);
+      TogglePump(PUMP_1_PIN_NUM, PUMP_OFF);
+
+      Serial.print(F("Toggling P2 for: "));
+      Serial.println(PUMP_ON_TIME_MS);
+      
+      TogglePump(PUMP_2_PIN_NUM, PUMP_ON);
+      delay(PUMP_ON_TIME_MS);
+      TogglePump(PUMP_2_PIN_NUM, PUMP_OFF);
+
+      Serial.print(F("Toggling P3 for: "));
+      Serial.println(PUMP_ON_TIME_MS);
+      
+      TogglePump(PUMP_3_PIN_NUM, PUMP_ON);
+      delay(PUMP_ON_TIME_MS);
+      TogglePump(PUMP_3_PIN_NUM, PUMP_OFF);
+
+      Serial.print(F("Toggling P3 for: "));
+      Serial.println(PUMP_ON_TIME_MS);
+      
+      TogglePump(PUMP_3_PIN_NUM, PUMP_ON);
+      delay(PUMP_ON_TIME_MS);
+      TogglePump(PUMP_3_PIN_NUM, PUMP_OFF);
+
+      Serial.print(F("Toggling P4 for: "));
+      Serial.println(PUMP_ON_TIME_MS);
+      
+      TogglePump(PUMP_4_PIN_NUM, PUMP_ON);
+      delay(PUMP_ON_TIME_MS);
+      TogglePump(PUMP_4_PIN_NUM, PUMP_OFF);
+      delay(PUMP_ON_TIME_MS);
+    }
+  }
+
+  // Normal operation mode
+  logMessage(F("System boot and setup done - Entering main loop"));
 }
 
 void loop() {
+  
   if (wakeup_flag || first_boot) {
     first_boot = false;
-    
-    // Print wakeup
-    bool h12, PM;
-    Serial.print(F("Woke up at: "));
-    Serial.print(rtc.getHour(h12, PM)); 
-    Serial.print(F(":"));
-    if (rtc.getMinute() < 10) Serial.print(F("0"));
-    Serial.print(rtc.getMinute());
-    Serial.print(F(":"));
-    if (rtc.getSecond() < 10) Serial.print(F("0"));
-    Serial.println(rtc.getSecond());
     
     clearAlarm();
     wakeup_flag = false;
     
-    sprintf(sd_log_entry, PSTR("Woke up at hour %d"), rtc.getHour(h12, PM));
-    WriteToSdLog(sd_log_entry);
+    // Print wakeup
+    bool h12, PM;
+
+    logMessage(F("Woke up at: "), false); 
+    logValue(rtc.getHour(h12, PM), false);
+    logMessage(F(":"), false);
+    if (rtc.getMinute() < 10) logMessage(F("0"), false);
+    logValue(rtc.getMinute(), false);
+    logMessage(F(":"), false);
+    if (rtc.getSecond() < 10) logMessage(F("0"), false);
+    logValue(rtc.getSecond());
     
     ReadAndCalculateAverageWaterDistance(current_average_water_level_distane_cm);
     
-    sprintf(sd_log_entry, PSTR("Current average water level distance %d"), current_average_water_level_distane_cm);
-    WriteToSdLog(sd_log_entry);
+    logMessage(F("Current average water level distance: "), false); 
+    logValue(current_average_water_level_distane_cm, false);
+    logMessage(F("cm"));           
     
     CapacitiveSoilSensorRead(SOIL_SENSOR_1_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
     if (soil_sensor_percentage <= SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE) {
-      Serial.print(F("Soil sensor percentage for sensor #1 (pin: "));
-      Serial.print(SOIL_SENSOR_1_IN_PIN_NUM);
-      Serial.println(F(") is below dry limit. Water needed."));
-      
-      sprintf(sd_log_entry, PSTR("SS1 indicates dry soil %d, water needed"),soil_sensor_percentage);
-      WriteToSdLog(sd_log_entry);
+      logMessage(F("Soil sensor percentage for sensor #1 (pin: "), false);
+      logValue(SOIL_SENSOR_1_IN_PIN_NUM, false);
+      logMessage(F(") is below dry limit - "));
+      logValue(soil_sensor_percentage, false);
+      logMessage(F("% with limit at: "), false);
+      logValue(SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE);
+      logMessage(F("SS1 indicates dry soil, water needed"));
       
       if (current_average_water_level_distane_cm < WATER_LEVEL_DISTANCE_EMPTY_CM) {
-        Serial.println(F("Water level ok. Allowed to start pump"));
+        logMessage(F("Water level ok. Allowed to start pump1"));
         TogglePump(PUMP_1_PIN_NUM, PUMP_ON);
-        delay(PUMP_ON_TIME_S);
+        delay(PUMP_ON_TIME_MS);
         TogglePump(PUMP_1_PIN_NUM, PUMP_OFF);
         
-        sprintf(sd_log_entry, PSTR("Pump1 used"));
-        WriteToSdLog(sd_log_entry);
+        logMessage(F("Pump1 used"));
       } else {
-        sprintf(sd_log_entry, PSTR("Pump1 not allowed to start due to water level"));
-        WriteToSdLog(sd_log_entry);
-        Serial.println(F("Water level indicates empty. Not allowed to start pump"));
+        logMessage(F("Pump1 not allowed to start due to water level"),true);
       }
     }
     
     CapacitiveSoilSensorRead(SOIL_SENSOR_2_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
     if (soil_sensor_percentage <= SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE) {
-      Serial.print(F("Soil sensor percentage for sensor #1 (pin: "));
-      Serial.print(SOIL_SENSOR_1_IN_PIN_NUM);
-      Serial.println(F(") is below dry limit. Water needed."));
-      
-      sprintf(sd_log_entry, PSTR("SS2 indicates dry soil %d, water needed"), soil_sensor_percentage);
-      WriteToSdLog(sd_log_entry);
+      logMessage(F("Soil sensor percentage for sensor #2 (pin: "), false);
+      logValue(SOIL_SENSOR_2_IN_PIN_NUM, false);
+      logMessage(F(") is below dry limit - "));
+      logValue(soil_sensor_percentage, false);
+      logMessage(F("% with limit at: "), false);
+      logValue(SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE);
+      logMessage(F("SS2 indicates dry soil, water needed"));
       
       if (current_average_water_level_distane_cm < WATER_LEVEL_DISTANCE_EMPTY_CM) {
-        Serial.println(F("Water level ok. Allowed to start pump"));
+        logMessage(F("Water level ok. Allowed to start pump"));
         TogglePump(PUMP_2_PIN_NUM, PUMP_ON);
-        delay(PUMP_ON_TIME_S);
+        delay(PUMP_ON_TIME_MS);
         TogglePump(PUMP_2_PIN_NUM, PUMP_OFF);
         
-        sprintf(sd_log_entry, PSTR("Pump2 used"));
-        WriteToSdLog(sd_log_entry);
+        logMessage(F("Pump2 used"));
       } else {
-        sprintf(sd_log_entry, PSTR("Pump2 not allowed to start due to water level"));
-        WriteToSdLog(sd_log_entry);
-        Serial.println(F("Water level indicates empty. Not allowed to start pump"));
+        logMessage(F("Pump2 not allowed to start due to water level"));
       }
     }
 
     CapacitiveSoilSensorRead(SOIL_SENSOR_3_IN_PIN_NUM, soil_sensor_raw_value, soil_sensor_percentage);
     if (soil_sensor_percentage <= SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE) {
-      Serial.print(F("Soil sensor percentage for sensor #1 (pin: "));
-      Serial.print(SOIL_SENSOR_1_IN_PIN_NUM);
-      Serial.println(F(") is below dry limit. Water needed."));
-
-      sprintf(sd_log_entry, PSTR("SS3 indicates dry soil %d, water needed"), soil_sensor_percentage);
-      WriteToSdLog(sd_log_entry);
+      logMessage(F("Soil sensor percentage for sensor #3 (pin: "), false);
+      logValue(SOIL_SENSOR_3_IN_PIN_NUM, false);
+      logMessage(F(") is below dry limit - "));
+      logValue(soil_sensor_percentage, false);
+      logMessage(F("% with limit at: "), false);
+      logValue(SOIL_MOISTURE_DRY_LIMIT_PERCENTAGE);
+      
+      logMessage(F("SS3 indicates dry soil, water needed"));
       
       if (current_average_water_level_distane_cm < WATER_LEVEL_DISTANCE_EMPTY_CM) {
-        Serial.println(F("Water level ok. Allowed to start pump"));
+        logMessage(F("Water level ok. Allowed to start pump"));
         TogglePump(PUMP_3_PIN_NUM, PUMP_ON);
-        delay(PUMP_ON_TIME_S);
+        delay(PUMP_ON_TIME_MS);
         TogglePump(PUMP_3_PIN_NUM, PUMP_OFF);
 
-        sprintf(sd_log_entry, PSTR("Pump3 used"));
-        WriteToSdLog(sd_log_entry);
+        logMessage(F("Pump3 is used"));
       } else {
-        sprintf(sd_log_entry, PSTR("Pump3 not allowed to start due to water level"));
-        WriteToSdLog(sd_log_entry);
-        Serial.println(F("Water level indicates empty. Not allowed to start pump"));
+        logMessage(F("Pump3 not allowed to start due to water level"));
       }
     }
     
     // Check if Venus needs water
     if (wakeup_counter >= VENUS_FLYTRAP_WATER_INTERVAL) {
-      Serial.println(F("Venus flytrap water interval reached"));
-      
-      sprintf(sd_log_entry, PSTR("Venus flytrap wakeup counter %d, water needed"), wakeup_counter);
-      WriteToSdLog(sd_log_entry);
+      logMessage(F("Venus flytrap water interval reached "), false);
+      logValue(wakeup_counter, false);
+      logMessage(F("/"), false);
+      logValue(VENUS_FLYTRAP_WATER_INTERVAL, false);
+      logMessage(F("wake-up runs"));
       
       if (venus_flytrap_pump_activation < VENUS_FLYTRAP_WATER_EMPTY_CYCLES) {
-        Serial.println(F("Activating venus flytrap pump"));
+        logMessage(F("Activating venus flytrap pump"));
         TogglePump(PUMP_4_PIN_NUM, PUMP_ON);
-        delay(PUMP_ON_TIME_S);
+        delay(PUMP_ON_TIME_MS);
         TogglePump(PUMP_4_PIN_NUM, PUMP_OFF);
 
-        sprintf(sd_log_entry, PSTR("Pump4 used"));
-        WriteToSdLog(sd_log_entry);
+        logMessage(F("Pump4 used"));
 
         // Reset counter (Do it inside if-statement on success, because we want to try again next time if water level has increased instead of waiting 4 days)
         wakeup_counter = 0;
         venus_flytrap_pump_activation += 1;
       } else {
-        sprintf(sd_log_entry, PSTR("Venus flytrap activation counter limit reached"));
-        WriteToSdLog(sd_log_entry);
-        Serial.print(F("Venus flytrap pump activation counter: "));
-        Serial.print(venus_flytrap_pump_activation);
-        Serial.print(F(" above set limit:"));
-        Serial.print(VENUS_FLYTRAP_WATER_EMPTY_CYCLES);
-        Serial.println(F(". Water can be empty. Pump not activated"));
+        logMessage(F("Venus flytrap pump activation counter limit reached ")); 
+        logMessage(F("Venus flytrap pump activation counter: "), false);
+        logValue(venus_flytrap_pump_activation, false);
+        logMessage(F(", activation counter limit: "), false);
+        logValue(VENUS_FLYTRAP_WATER_EMPTY_CYCLES, false);
+        logMessage(F(". Water migt be empty now. Pump4 not started"));
+
       }
     }
 
-    sprintf(sd_log_entry, PSTR("Going to sleep"));
-    WriteToSdLog(sd_log_entry);
+    logMessage(F("Preparing sleep logic -> Going to sleep..")); 
     
     SetAlarmForNextInterval(SLEEP_INTERVAL_MINUTES);
-    delay(1000);  // Give some time for serial output 
-  }
-  
+    // Debug print if needed
+    //Serial.print(F("RTC time now: "));
+    //Serial.print(rtc.getHour(h12, PM));
+    //Serial.print(F(":"));
+    //if (rtc.getMinute() < 10) Serial.print(F("0"));
+    //  Serial.println(rtc.getMinute());
+    //  delay(1000);  // Give some time for serial output 
+    }
+
   GoToSleep();
 }
